@@ -1,4 +1,4 @@
-name: Patch IPA with Frida (robust + diagnostic)
+name: Patch IPA with Frida (final)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   patch:
     runs-on: macos-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -20,7 +20,7 @@ jobs:
       - name: Download IPA and dylib (from Releases)
         run: |
           cd work
-          # ----- YOUR RELEASE ASSET LINKS -----
+          # ----- REPLACE THESE IF YOUR RELEASE LINKS CHANGE -----
           curl -L -o crssplay_frida_localpatched.ipa "https://github.com/ColtonDavis/will-work/releases/download/1/crssplay_frida_localpatched.ipa"
           curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://github.com/ColtonDavis/will-work/releases/download/1/frida-gadget-17.3.2-ios-universal.dylib"
           echo "Downloaded files in work/:"
@@ -34,36 +34,34 @@ jobs:
           HEADER=$(xxd -p -l 4 crssplay_frida_localpatched.ipa || true)
           echo "Header hex: $HEADER"
           if [ "$HEADER" != "504b0304" ]; then
-            echo "ERROR: IPA header is not PK.. (504b0304). This likely means the downloaded file is not a real IPA (maybe an HTML page or wrong URL). Aborting."
+            echo "ERROR: IPA header is not PK.. (504b0304). The downloaded file may not be a real IPA. Aborting."
             exit 2
           fi
 
       - name: Extract IPA (robust + diagnostics)
         run: |
+          set -e
           cd work
           rm -rf work_unzip || true
           mkdir -p work_unzip
-          echo "Attempting extraction with ditto (macOS tolerant)..."
+          echo "Attempting extraction with ditto..."
           if ditto -x -k crssplay_frida_localpatched.ipa work_unzip; then
             echo "ditto extraction succeeded."
           else
-            echo "ditto extraction failed or returned non-zero; showing unzip listing for diagnostics and attempting unzip fallback..."
-            unzip -l crssplay_frida_localpatched.ipa | sed -n '1,120p' || true
+            echo "ditto returned non-zero; showing unzip listing and attempting unzip fallback..."
+            unzip -l crssplay_frida_localpatched.ipa | sed -n '1,200p' || true
             unzip -o crssplay_frida_localpatched.ipa -d work_unzip || true
           fi
-
           echo
-          echo "=== top-level work_unzip listing ==="
+          echo "Top-level of work_unzip:"
           ls -la work_unzip || true
-          echo
-          echo "=== directory tree (depth=4) under work_unzip ==="
+          echo "Directory tree (depth=4):"
           find work_unzip -maxdepth 4 -ls || true
-          echo
 
+          # find Payload anywhere under work_unzip
           PAYLOAD_DIR=$(find work_unzip -type d -name "Payload" -print -quit || true)
           if [ -z "$PAYLOAD_DIR" ]; then
             echo "ERROR: Payload folder not found under work_unzip. Extraction failed or archive structure unexpected."
-            echo "Dumping full work_unzip listing for debug:"
             find work_unzip -maxdepth 10 -ls || true
             exit 3
           fi
@@ -73,7 +71,8 @@ jobs:
       - name: Copy Frida dylib into .app and inject into dfxm (optool)
         run: |
           set -euo pipefail
-          # compute payload dir and app path
+
+          # locate payload and app
           PAYLOAD_DIR=$(find work_unzip -type d -name "Payload" -print -quit)
           if [ -z "$PAYLOAD_DIR" ]; then
             echo "ERROR: Payload not found; aborting."
@@ -89,16 +88,16 @@ jobs:
           fi
           echo "App bundle found: $APP_PATH"
 
-          # use the known main executable name dfxm (fallback to CFBundleExecutable if not present)
+          # assume executable name is 'dfxm'; fallback to CFBundleExecutable
           EXE_PATH="$APP_PATH/dfxm"
           if [ ! -f "$EXE_PATH" ]; then
-            echo "dfxm not found at $EXE_PATH; listing app contents:"
+            echo "Warning: dfxm not present at $EXE_PATH. Listing app contents:"
             ls -la "$APP_PATH" || true
             if [ -f "$APP_PATH/Info.plist" ]; then
               execname=$(defaults read "$APP_PATH/Info.plist" CFBundleExecutable 2>/dev/null || true)
               if [ -n "$execname" ]; then
                 EXE_PATH="$APP_PATH/$execname"
-                echo "Falling back to CFBundleExecutable: $EXE_PATH"
+                echo "Using CFBundleExecutable fallback: $EXE_PATH"
               fi
             fi
             if [ ! -f "$EXE_PATH" ]; then
@@ -109,12 +108,12 @@ jobs:
           echo "Target executable: $EXE_PATH"
           ls -lh "$EXE_PATH" || true
 
-          # copy frida gadget into Frameworks
+          # copy frida dylib into Frameworks
           mkdir -p "$APP_PATH/Frameworks"
           if [ -f work/frida-gadget-17.3.2-ios-universal.dylib ]; then
             cp work/frida-gadget-17.3.2-ios-universal.dylib "$APP_PATH/Frameworks/"
           else
-            echo "ERROR: frida dylib not found in work/ - listing work/:"
+            echo "ERROR: frida-gadget dylib not found in work/"
             ls -la work || true
             exit 1
           fi
@@ -122,9 +121,9 @@ jobs:
           echo "Frameworks contents:"
           ls -la "$APP_PATH/Frameworks" || true
 
-          # ensure optool is available (try prebuilt then build)
+          # ensure optool present: try prebuilt then build if needed
           if ! command -v optool >/dev/null 2>&1; then
-            echo "optool not found — trying prebuilt package..."
+            echo "optool not found — downloading prebuilt attempt..."
             OPTZIP="https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip"
             if curl -sSL "$OPTZIP" -o /tmp/optool.zip; then
               unzip -o /tmp/optool.zip -d /tmp/optool_tmp || true
@@ -143,29 +142,29 @@ jobs:
               sudo mv optool /usr/local/bin/optool
               sudo chmod +x /usr/local/bin/optool
             else
-              echo "ERROR: optool build failed. Aborting."
+              echo "ERROR: optool build failed; aborting."
               ls -la || true
               exit 1
             fi
             cd -
           fi
-          echo "optool ready: $(which optool || true)"
+          echo "optool available at: $(command -v optool || true)"
 
-          # do the injection
-          echo "Running optool to install LC_LOAD_DYLIB..."
-          sudo /usr/local/bin/optool install -c load -p "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" -t "$EXE_PATH" || { echo "optool failed"; exit 1; }
-          echo "optool injection completed."
+          # inject the LC_LOAD_DYLIB entry
+          echo "Injecting frida gadget into $EXE_PATH ..."
+          sudo /usr/local/bin/optool install -c load -p "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" -t "$EXE_PATH" || { echo "optool injection failed"; exit 1; }
+          echo "optool injection complete."
 
-          # verification: prefer otool -L then fallback to strings
-          VERFILE="$(pwd)/../../otool_verification.txt"
-          echo "Writing verification output to $VERFILE"
+          # create verification file
+          VER_FILE="$(pwd)/../../otool_verification.txt"
+          echo "Verification output will be written to $VER_FILE"
           if command -v otool >/dev/null 2>&1; then
-            otool -L "$EXE_PATH" > "$VERFILE" 2>&1 || true
+            otool -L "$EXE_PATH" > "$VER_FILE" 2>&1 || true
           else
-            strings "$EXE_PATH" > "$VERFILE" 2>&1 || true
+            strings "$EXE_PATH" > "$VER_FILE" 2>&1 || true
           fi
-          echo "Verification file contents:"
-          sed -n '1,200p' "$VERFILE" || true
+          echo "Verification snippet:"
+          sed -n '1,200p' "$VER_FILE" || true
 
       - name: Upload otool verification artifact
         uses: actions/upload-artifact@v4
@@ -178,7 +177,7 @@ jobs:
           cd work_unzip
           zip -r ../crssplay_frida_patched.ipa Payload
           cd ..
-          echo "Patched IPA:"
+          echo "Patched IPA created:"
           ls -lh crssplay_frida_patched.ipa || true
 
       - name: Upload patched IPA artifact
