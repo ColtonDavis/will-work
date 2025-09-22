@@ -14,76 +14,93 @@ jobs:
 
       - name: Prepare workspace
         run: |
+          # clean workspace directories we use
           rm -rf work work_unzip || true
           mkdir -p work work_unzip
 
       - name: Download IPA and dylib (from Releases)
         run: |
           cd work
-          # YOUR RELEASE ASSET LINKS (already provided)
+          # ==== REPLACE THESE URLS IF YOU CHANGE THE RELEASE ASSETS ====
           curl -L -o crssplay_frida_localpatched.ipa "https://github.com/ColtonDavis/will-work/releases/download/1/crssplay_frida_localpatched.ipa"
           curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://github.com/ColtonDavis/will-work/releases/download/1/frida-gadget-17.3.2-ios-universal.dylib"
-          echo "Downloaded files:"
+          echo "Downloaded files (work directory):"
           ls -lh
 
-      - name: Quick verify first bytes
+      - name: Quick verify first bytes of IPA
         run: |
           cd work
-          echo "IPA head (hex):"; hexdump -C -n 8 crssplay_frida_localpatched.ipa || true
-          head4=$(xxd -p -l 4 crssplay_frida_localpatched.ipa || true)
-          if [ "$head4" != "504b0304" ]; then
-            echo "ERROR: IPA does not look like a ZIP/IPA (starts: $head4). Aborting."; exit 2
+          echo "IPA head (hex):"
+          # print first 16 bytes in hex
+          hexdump -C -n 16 crssplay_frida_localpatched.ipa || true
+          # quick check for PK.. header
+          header=$(xxd -p -l 4 crssplay_frida_localpatched.ipa || true)
+          echo "First 4 bytes (hex): $header"
+          if [ "$header" != "504b0304" ]; then
+            echo "ERROR: IPA does not have ZIP header (504b0304). It may be an HTML page or wrong file. Aborting." 
+            exit 2
           fi
 
-      - name: Extract IPA (use ditto for robustness)
+      - name: Extract IPA (robust + diagnostics)
         run: |
           cd work
           rm -rf work_unzip || true
           mkdir -p work_unzip
-          echo "Extracting with ditto (more tolerant on macOS)..."
+          echo "Attempting extraction with ditto (macOS-friendly)..."
           if ditto -x -k crssplay_frida_localpatched.ipa work_unzip; then
             echo "ditto extraction succeeded."
           else
-            echo "ditto failed; attempting unzip fallback for diagnostics..."
+            echo "ditto extraction failed or returned non-zero; showing unzip listing for diagnostics and trying unzip fallback..."
+            unzip -l crssplay_frida_localpatched.ipa | head -n 100 || true
             unzip -o crssplay_frida_localpatched.ipa -d work_unzip || true
           fi
+
           echo
-          echo "Top-level listing of work_unzip:"
+          echo "=== top-level of work_unzip ==="
           ls -la work_unzip || true
           echo
-          echo "Payload listing (if present):"
-          ls -la work_unzip/Payload || true
-          # sanity: must have Payload
+          echo "=== showing first 200 entries of unzip -l output (if any) ==="
+          unzip -l crssplay_frida_localpatched.ipa | sed -n '1,200p' || true
+          echo
+          echo "=== directory tree (depth=3) under work_unzip ==="
+          find work_unzip -maxdepth 3 -ls || true
+          echo
           if [ ! -d work_unzip/Payload ]; then
-            echo "ERROR: Payload not found in extracted IPA. Aborting."
-            find work_unzip -maxdepth 5 -ls || true
+            echo "ERROR: Payload directory not present under work_unzip. Extraction failed or archive structure unexpected."
+            echo "Dumping full listing for debug:"
+            find work_unzip -maxdepth 10 -ls || true
             exit 3
           fi
+          echo "Payload found. Listing Payload top-level:"
+          ls -la work_unzip/Payload || true
 
-      - name: Copy Frida dylib into app & inject into dfxm (safe, diagnostic)
+      - name: Copy Frida dylib into app & inject into dfxm (safe & diagnostic)
         run: |
           set -euo pipefail
-          # Work inside the extracted Payload
+          # operate from repo root; downloaded files are in work/
+          # move into extracted payload area
           cd work_unzip/Payload
 
-          # Auto-detect the .app folder (first .app found)
+          echo "Detecting .app folder inside Payload..."
           APP_REL_PATH=$(find . -type d -name "*.app" -print -quit || true)
           if [ -z "$APP_REL_PATH" ]; then
-            echo "ERROR: no .app found in Payload. Aborting."
-            find . -maxdepth 4 -ls || true
+            echo "ERROR: no .app found under Payload. Aborting."
+            find . -maxdepth 3 -ls
             exit 1
           fi
-          # normalize path (strip leading ./)
+
+          # normalize and create absolute path
           APP_REL_PATH="${APP_REL_PATH#./}"
           APP_PATH="$(pwd)/${APP_REL_PATH}"
           echo "Found app: $APP_PATH"
 
-          # Set executable path to dfxm (you confirmed main exe is dfxm)
+          # set path to executable (you said it's called 'dfxm')
           EXE_PATH="$APP_PATH/dfxm"
           if [ ! -f "$EXE_PATH" ]; then
-            echo "WARNING: dfxm not found at $EXE_PATH; listing app contents:"
+            echo "WARNING: Expected executable dfxm not at $EXE_PATH"
+            echo "Listing app contents:"
             ls -la "$APP_PATH" || true
-            # fallback to CFBundleExecutable if present
+            # try to read CFBundleExecutable fallback
             if [ -f "$APP_PATH/Info.plist" ]; then
               execname=$(defaults read "$APP_PATH/Info.plist" CFBundleExecutable 2>/dev/null || true)
               if [ -n "$execname" ]; then
@@ -96,25 +113,26 @@ jobs:
               exit 1
             fi
           fi
-          echo "Target executable: $EXE_PATH"
+          echo "Target executable resolved: $EXE_PATH"
+          echo "Executable file info:"
+          ls -lh "$EXE_PATH" || true
 
-          # Copy the frida dylib into Frameworks inside the .app
+          # copy frida dylib into app Frameworks
           mkdir -p "$APP_PATH/Frameworks"
-          # our download saved the dylib in work/ (two levels up from here)
           if [ -f ../../frida-gadget-17.3.2-ios-universal.dylib ]; then
             cp ../../frida-gadget-17.3.2-ios-universal.dylib "$APP_PATH/Frameworks/"
           else
-            echo "ERROR: frida-gadget dylib not found at work/frida-gadget-17.3.2-ios-universal.dylib"
+            echo "ERROR: frida dylib not present in expected location 'work/frida-gadget-17.3.2-ios-universal.dylib'"
             ls -la ../../ || true
             exit 1
           fi
           chmod 755 "$APP_PATH/Frameworks/frida-gadget-17.3.2-ios-universal.dylib"
-          echo "Frameworks contents after copy:"
-          ls -la "$APP_PATH/Frameworks"
+          echo "Frameworks contents:"
+          ls -la "$APP_PATH/Frameworks" || true
 
-          # Ensure optool exists: try a prebuilt then build if necessary
+          # ensure optool exists - try download prebuilt; else build
           if ! command -v optool >/dev/null 2>&1; then
-            echo "optool not found — trying to download prebuilt..."
+            echo "optool not found — trying prebuilt download..."
             OPTZIP="https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip"
             if curl -sSL "$OPTZIP" -o /tmp/optool.zip; then
               unzip -o /tmp/optool.zip -d /tmp/optool_tmp || true
@@ -124,8 +142,9 @@ jobs:
               fi
             fi
           fi
+
           if ! command -v optool >/dev/null 2>&1; then
-            echo "Prebuilt optool not available — building from source..."
+            echo "Prebuilt optool not available — attempting build from source..."
             git clone https://github.com/alexzielenski/optool.git /tmp/optool_src
             cd /tmp/optool_src
             make || true
@@ -139,26 +158,24 @@ jobs:
             fi
             cd -
           fi
-          echo "optool is available: $(which optool || true)"
+          echo "optool is present at: $(command -v optool || true)"
 
-          # Inject LC_LOAD_DYLIB for the frida gadget
-          echo "Injecting frida gadget load command into executable..."
+          # inject LC_LOAD_DYLIB
+          echo "Running optool to inject LC_LOAD_DYLIB for frida gadget..."
           sudo /usr/local/bin/optool install -c load -p "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" -t "$EXE_PATH" || { echo "optool injection failed"; exit 1; }
 
-          # Verify injection: prefer otool -L if present, else strings
+          echo "Injection attempt done. Verifying binary for frida load entry..."
           if command -v otool >/dev/null 2>&1; then
-            echo "Verification (otool -L filtered for frida):"
-            otool -L "$EXE_PATH" | grep -i frida || echo "no frida entry visible to otool"
+            otool -L "$EXE_PATH" | grep -i frida || echo "No frida load entry shown by otool"
           else
-            echo "otool not present; checking strings for frida:"
-            strings "$EXE_PATH" | grep -i frida || echo "no frida string found in binary"
+            echo "otool not present; using strings fallback to search for frida:"
+            strings "$EXE_PATH" | grep -i frida || echo "No frida string found in binary"
           fi
 
-          echo "Copy + inject completed successfully."
+          echo "Copy + inject step completed."
 
       - name: Repack IPA
         run: |
-          # go back to workspace root where work_unzip/ lives
           cd work_unzip
           zip -r ../crssplay_frida_patched.ipa Payload
           cd ..
