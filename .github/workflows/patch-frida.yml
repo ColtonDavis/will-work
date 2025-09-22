@@ -1,4 +1,4 @@
-name: Patch IPA with Frida (final)
+name: Patch IPA with Frida (final + robust payload detection)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       - name: Download IPA and dylib (from Releases)
         run: |
           cd work
-          # ----- REPLACE THESE IF YOUR RELEASE LINKS CHANGE -----
+          # ---- ensure these are the correct release asset URLs ----
           curl -L -o crssplay_frida_localpatched.ipa "https://github.com/ColtonDavis/will-work/releases/download/1/crssplay_frida_localpatched.ipa"
           curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://github.com/ColtonDavis/will-work/releases/download/1/frida-gadget-17.3.2-ios-universal.dylib"
           echo "Downloaded files in work/:"
@@ -29,7 +29,7 @@ jobs:
       - name: Quick verify first bytes of IPA
         run: |
           cd work
-          echo "First 16 bytes (hex):"
+          echo "First 16 bytes (hex) of IPA:"
           hexdump -C -n 16 crssplay_frida_localpatched.ipa || true
           HEADER=$(xxd -p -l 4 crssplay_frida_localpatched.ipa || true)
           echo "Header hex: $HEADER"
@@ -53,45 +53,44 @@ jobs:
             unzip -o crssplay_frida_localpatched.ipa -d work_unzip || true
           fi
           echo
-          echo "Top-level of work_unzip:"
+          echo "Top-level work_unzip listing:"
           ls -la work_unzip || true
           echo "Directory tree (depth=4):"
           find work_unzip -maxdepth 4 -ls || true
 
-          # find Payload anywhere under work_unzip
+          # find Payload anywhere under work_unzip and save it
           PAYLOAD_DIR=$(find work_unzip -type d -name "Payload" -print -quit || true)
           if [ -z "$PAYLOAD_DIR" ]; then
-            echo "ERROR: Payload folder not found under work_unzip. Extraction failed or archive structure unexpected."
+            echo "ERROR: Payload folder not found under work_unzip. Dump full tree for debug:"
             find work_unzip -maxdepth 10 -ls || true
             exit 3
           fi
           echo "Payload detected at: $PAYLOAD_DIR"
           ls -la "$PAYLOAD_DIR" || true
+          # store for later steps
+          echo "$PAYLOAD_DIR" > ../payload_path.txt
 
       - name: Copy Frida dylib into .app and inject into dfxm (optool)
         run: |
           set -euo pipefail
 
-          # locate payload and app
-          PAYLOAD_DIR=$(find work_unzip -type d -name "Payload" -print -quit)
-          if [ -z "$PAYLOAD_DIR" ]; then
-            echo "ERROR: Payload not found; aborting."
-            exit 1
-          fi
-          echo "Using Payload: $PAYLOAD_DIR"
+          # read the payload path saved earlier
+          PAYLOAD_DIR=$(cat work/payload_path.txt)
+          echo "Using payload dir: $PAYLOAD_DIR"
 
+          # find .app under payload
           APP_PATH=$(find "$PAYLOAD_DIR" -type d -name "*.app" -print -quit || true)
           if [ -z "$APP_PATH" ]; then
-            echo "ERROR: no .app bundle found under Payload"
+            echo "ERROR: no .app found under Payload ($PAYLOAD_DIR)"
             find "$PAYLOAD_DIR" -maxdepth 3 -ls || true
             exit 1
           fi
           echo "App bundle found: $APP_PATH"
 
-          # assume executable name is 'dfxm'; fallback to CFBundleExecutable
+          # target main executable (dfxm) - fallback to CFBundleExecutable
           EXE_PATH="$APP_PATH/dfxm"
           if [ ! -f "$EXE_PATH" ]; then
-            echo "Warning: dfxm not present at $EXE_PATH. Listing app contents:"
+            echo "Warning: dfxm not at expected path $EXE_PATH. Listing app contents:"
             ls -la "$APP_PATH" || true
             if [ -f "$APP_PATH/Info.plist" ]; then
               execname=$(defaults read "$APP_PATH/Info.plist" CFBundleExecutable 2>/dev/null || true)
@@ -101,19 +100,19 @@ jobs:
               fi
             fi
             if [ ! -f "$EXE_PATH" ]; then
-              echo "ERROR: main executable not found in app bundle. Aborting."
+              echo "ERROR: executable not found in app bundle; aborting."
               exit 1
             fi
           fi
           echo "Target executable: $EXE_PATH"
           ls -lh "$EXE_PATH" || true
 
-          # copy frida dylib into Frameworks
+          # copy the frida gadget into Frameworks
           mkdir -p "$APP_PATH/Frameworks"
           if [ -f work/frida-gadget-17.3.2-ios-universal.dylib ]; then
             cp work/frida-gadget-17.3.2-ios-universal.dylib "$APP_PATH/Frameworks/"
           else
-            echo "ERROR: frida-gadget dylib not found in work/"
+            echo "ERROR: frida-gadget dylib not found in work/; aborting."
             ls -la work || true
             exit 1
           fi
@@ -121,9 +120,9 @@ jobs:
           echo "Frameworks contents:"
           ls -la "$APP_PATH/Frameworks" || true
 
-          # ensure optool present: try prebuilt then build if needed
+          # ensure optool is installed (try prebuilt then build)
           if ! command -v optool >/dev/null 2>&1; then
-            echo "optool not found — downloading prebuilt attempt..."
+            echo "optool not found — attempting prebuilt download..."
             OPTZIP="https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip"
             if curl -sSL "$OPTZIP" -o /tmp/optool.zip; then
               unzip -o /tmp/optool.zip -d /tmp/optool_tmp || true
@@ -142,7 +141,7 @@ jobs:
               sudo mv optool /usr/local/bin/optool
               sudo chmod +x /usr/local/bin/optool
             else
-              echo "ERROR: optool build failed; aborting."
+              echo "ERROR: optool build failed. Aborting."
               ls -la || true
               exit 1
             fi
@@ -150,20 +149,19 @@ jobs:
           fi
           echo "optool available at: $(command -v optool || true)"
 
-          # inject the LC_LOAD_DYLIB entry
-          echo "Injecting frida gadget into $EXE_PATH ..."
+          # inject LC_LOAD_DYLIB into the executable
+          echo "Injecting frida gadget into executable..."
           sudo /usr/local/bin/optool install -c load -p "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" -t "$EXE_PATH" || { echo "optool injection failed"; exit 1; }
-          echo "optool injection complete."
+          echo "Injection done."
 
-          # create verification file
-          VER_FILE="$(pwd)/../../otool_verification.txt"
-          echo "Verification output will be written to $VER_FILE"
+          # verification output (otool or strings)
+          VER_FILE="work_unzip/otool_verification.txt"
           if command -v otool >/dev/null 2>&1; then
             otool -L "$EXE_PATH" > "$VER_FILE" 2>&1 || true
           else
             strings "$EXE_PATH" > "$VER_FILE" 2>&1 || true
           fi
-          echo "Verification snippet:"
+          echo "Verification file written; head of file:"
           sed -n '1,200p' "$VER_FILE" || true
 
       - name: Upload otool verification artifact
